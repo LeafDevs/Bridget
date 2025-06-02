@@ -1,114 +1,74 @@
-# CodeEditor
+# Bridget
 
-A modern code editor built with Electron, React, and TypeScript featuring AI-powered assistance with tool calling capabilities.
+An open-source AI-assisted code editor built with Electron, React, and TypeScript featuring intelligent coding assistance with tool calling capabilities.
 
 ## Features
 
-- **Monaco Editor Integration**: Full-featured code editor with syntax highlighting
-- **Integrated Terminal**: Built-in terminal with PTY support
-- **File Explorer**: Tree-view file browser with folder navigation
-- **AI Chat Assistant**: AI-powered coding assistant with tool calling capabilities
+- **Monaco Editor Integration**: Full-featured code editor with syntax highlighting and IntelliSense
+- **Integrated Terminal**: Built-in terminal with PTY support for seamless command execution
+- **File Explorer**: Tree-view file browser with intuitive folder navigation
+- **AI Chat Assistant**: Intelligent coding assistant that can interact with your development environment
 - **Multi-Provider AI Support**: Support for OpenAI, Anthropic, Gemini, OpenRouter, and local Ollama models
+- **Tool Calling System**: AI can execute actions in your development environment
 
-## AI Tool Calling System
+## AI-Assisted Development
 
-The AI chat assistant has access to several tools that allow it to interact with your development environment:
+Bridget's AI assistant goes beyond simple chat - it can actively help with your development workflow by:
 
-### Available Tools
+- Reading and analyzing your code files
+- Making code changes and creating new files
+- Running commands and scripts
+- Searching through your codebase
+- Providing contextual assistance based on your project structure
 
-1. **File Operations**
-   - `readFile`: Read the contents of any file
-   - `writeFile`: Create or modify files
-   - `listDirectory`: Browse directory contents
+## Contributing
 
-2. **Code Analysis**
-   - `searchFiles`: Search for text patterns across your codebase
-   - Support for various file types (JS, TS, Python, etc.)
+We welcome contributions to Bridget! Whether you're fixing bugs, adding features, or improving documentation, your help is appreciated.
 
-3. **System Commands**
-   - `executeCommand`: Run shell commands and scripts
-   - Full access to your development tools
+### 🚀 Getting Started
 
-### Example Usage
+Ready to dive into Bridget development? Follow these simple steps to get your local environment up and running:
 
-You can ask the AI assistant to:
+#### 📦 Prerequisites
+- [Bun](https://bun.sh/) - Fast all-in-one JavaScript runtime
+- [Node.js](https://nodejs.org/) (v16 or higher)
+- [Git](https://git-scm.com/)
 
-```
-"Read the package.json file and show me the dependencies"
-"Search for all TODO comments in my TypeScript files"
-"Run npm install in the current directory"
-"Create a new React component called UserProfile"
-"Show me all files in the src/components directory"
-```
+#### 🛠️ Setup Instructions
 
-### Supported AI Providers
+1. **Clone the Repository**
+   ```bash
+   git clone https://github.com/leafdevs/bridget.git
+   cd bridget
+   ```
 
-- **OpenAI**: GPT-4, GPT-3.5, etc.
-- **Anthropic**: Claude models
-- **Google Gemini**: Gemini Pro models
-- **OpenRouter**: Access to various models
-- **Ollama**: Local LLM execution
+2. **Install Dependencies**
+   ```bash
+   bun install
+   ```
 
-### Configuration
+3. **Launch Development Environment**
+   ```bash
+   bun run electron-dev
+   ```
+🎉 **That's it!** Bridget should now be running in development mode. The application will automatically reload when you make changes to the source code.
 
-1. Click the gear icon in the AI Chat panel
-2. Select your preferred AI provider
-3. Enter the appropriate model name
-4. Add your API key (not required for Ollama)
+> **Note:** Changes to the Electron main process (backend) will require restarting the development server, while frontend changes will hot-reload automatically.
 
-API keys are stored locally and securely in your browser's localStorage.
 
-## Development
+#### 🔧 Additional Commands
 
-```bash
-# Install dependencies
-npm install
+- `bun run build` - Build the application for production
+- `bun run test` - Run the test suite
+- `bun run lint` - Check code style and formatting
 
-# Start development server
-npm run electron-dev
 
-# Build for production
-npm run dist
-```
+## ⭐ Star History
 
-## Architecture
+[![Star History Chart](https://api.star-history.com/svg?repos=leafdevs/bridget&type=Date)](https://star-history.com/#leafdevs/bridget&Date)
 
-### Electron Security
+---
 
-The application follows Electron security best practices:
-- Context isolation enabled
-- Node integration disabled in renderer
-- Secure IPC communication between main and renderer processes
+**Made with ❤️ by Leaf**
 
-### Tool Calling Flow
-
-1. User sends message to AI chat
-2. AI processes the request and may call tools
-3. Tool calls are executed in the main Electron process
-4. Results are returned to AI for final response
-5. Complete response with tool execution results shown to user
-
-### File Structure
-
-```
-src/
-├── components/          # React components
-│   ├── ChatPanel.tsx   # AI chat interface
-│   ├── FileBrowser.tsx # File explorer
-│   └── ...
-├── lib/
-│   └── AIChat.ts       # AI and tool calling logic
-└── types/
-    └── electron.d.ts   # TypeScript definitions
-```
-
-## Security Considerations
-
-- All file operations are sandboxed to your project directory
-- API keys are stored locally and never transmitted except to the chosen AI provider
-- Tool execution happens in the main process with appropriate permissions
-- Command execution respects system permissions and working directory
-
-## License
-
-MIT License
+If you find Bridget helpful, please consider giving us a star! ⭐
