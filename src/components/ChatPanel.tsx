@@ -30,6 +30,13 @@ interface Message {
   isExecutingTools?: boolean
   executingToolIndex?: number
   continuedContent?: string
+  // New structure for multi-round responses
+  responseRounds?: Array<{
+    content: string
+    thinking?: string[]
+    toolCalls?: ToolCallParams[]
+    toolResults?: ToolCallResult[]
+  }>
 }
 
 interface ChatSettings {
@@ -439,102 +446,207 @@ export default function ChatPanel() {
           : msg
       ))
 
-      // Execute tool calls if any (only in agent mode)
+      // Execute tool calls iteratively if any (only in agent mode)
       if (mode === 'agent' && toolCalls && toolCalls.length > 0) {
-        // Show tool execution in real-time
-        setMessages(prev => prev.map(msg => 
-          msg.id === assistantMessageId 
-            ? { ...msg, content, toolCalls, isExecutingTools: true }
-            : msg
-        ))
+        const maxToolCalls = 20
+        let totalToolCallsExecuted = 0
+        let responseRounds: Array<{
+          content: string
+          thinking?: string[]
+          toolCalls?: ToolCallParams[]
+          toolResults?: ToolCallResult[]
+        }> = []
 
-        const toolResults: ToolCallResult[] = []
+        // Parse initial content for thinking
+        const { content: initialCleanContent, thinking: initialThinking } = parseThinkingContent(content)
+        
+        // Add initial round
+        responseRounds.push({
+          content: initialCleanContent,
+          thinking: initialThinking.length > 0 ? initialThinking : undefined,
+          toolCalls: toolCalls,
+          toolResults: undefined
+        })
 
-        // Execute tools one by one and show progress
-        for (let i = 0; i < toolCalls.length; i++) {
-          const toolCall = toolCalls[i]
-          
-          // Update UI to show current tool being executed
+        let currentToolCalls = toolCalls
+        let roundIndex = 0
+
+        // Iterative tool calling loop
+        while (currentToolCalls && currentToolCalls.length > 0 && totalToolCallsExecuted < maxToolCalls) {
+          // Check if we're approaching the limit
+          if (totalToolCallsExecuted + currentToolCalls.length > maxToolCalls) {
+            const remainingCalls = maxToolCalls - totalToolCallsExecuted
+            currentToolCalls = currentToolCalls.slice(0, remainingCalls)
+          }
+
+          // Update current round with tool calls
+          responseRounds[roundIndex].toolCalls = currentToolCalls
+
+          // Show tool execution in real-time
           setMessages(prev => prev.map(msg => 
             msg.id === assistantMessageId 
-              ? { ...msg, executingToolIndex: i }
+              ? { 
+                  ...msg, 
+                  content: initialCleanContent,
+                  responseRounds: [...responseRounds],
+                  isExecutingTools: true
+                }
               : msg
           ))
+
+          const roundResults: ToolCallResult[] = []
+
+          // Execute tools one by one and show progress
+          for (let i = 0; i < currentToolCalls.length; i++) {
+            const toolCall = currentToolCalls[i]
+            const globalToolIndex = totalToolCallsExecuted + i
+            
+            // Update UI to show current tool being executed
+            setMessages(prev => prev.map(msg => 
+              msg.id === assistantMessageId 
+                ? { ...msg, executingToolIndex: globalToolIndex }
+                : msg
+            ))
+
+            try {
+              const result = await executeToolCall(toolCall)
+              roundResults.push(result)
+            } catch (error) {
+              roundResults.push({
+                success: false,
+                error: error instanceof Error ? error.message : 'Unknown error'
+              })
+            }
+          }
+
+          // Update current round with results
+          responseRounds[roundIndex].toolResults = roundResults
+          totalToolCallsExecuted += currentToolCalls.length
+
+          // Mark current round of tools as completed
+          setMessages(prev => prev.map(msg => 
+            msg.id === assistantMessageId 
+              ? { 
+                  ...msg, 
+                  responseRounds: [...responseRounds],
+                  isExecutingTools: false, 
+                  executingToolIndex: undefined 
+                }
+              : msg
+          ))
+
+          // Prepare tool context for this round
+          const roundToolContext = roundResults.map((result, i) => {
+            const toolName = currentToolCalls[i].name
+            const args = JSON.stringify(currentToolCalls[i].arguments)
+            if (result.success) {
+              return `Tool: ${toolName}(${args})\nResult: ${JSON.stringify(result.data || result)}`
+            } else {
+              return `Tool: ${toolName}(${args})\nError: ${result.error}`
+            }
+          }).join('\n\n')
+
+          // Check if we've hit the limit
+          if (totalToolCallsExecuted >= maxToolCalls) {
+            responseRounds.push({
+              content: `*Maximum tool calls (${maxToolCalls}) reached. Please manually continue the conversation if you need more analysis.*`,
+              toolCalls: undefined,
+              toolResults: undefined
+            })
+            break
+          }
+
+          // Continue the AI conversation with tool results and allow more tool calls
+          const continuationPrompt = `Based on the tool execution results, please continue your response. If you need more information to provide a complete answer, feel free to make additional tool calls (e.g., read more files, search different directories, execute commands, etc.). Otherwise, provide your final analysis/conclusion:\n\n${roundToolContext}`
 
           try {
-            const result = await executeToolCall(toolCall)
-            toolResults.push(result)
-          } catch (error) {
-            toolResults.push({
-              success: false,
-              error: error instanceof Error ? error.message : 'Unknown error'
+            let streamingContent = ''
+            const { content: newContinuedContent, toolCalls: newToolCalls } = await callAI([
+              ...messages, 
+              userMessage, 
+              { 
+                id: assistantMessageId, 
+                content: initialCleanContent, 
+                role: 'assistant', 
+                timestamp: new Date(),
+                responseRounds: responseRounds
+              },
+              {
+                id: Date.now().toString(),
+                content: continuationPrompt,
+                role: 'user',
+                timestamp: new Date()
+              }
+             ], (chunk: string) => {
+               // Stream the continued response
+               streamingContent += chunk
+               const tempRounds = [...responseRounds]
+               if (tempRounds.length === roundIndex + 1) {
+                 // Add new round for streaming
+                 tempRounds.push({
+                   content: streamingContent,
+                   toolCalls: undefined,
+                   toolResults: undefined
+                 })
+               } else {
+                 // Update existing round
+                 tempRounds[roundIndex + 1].content = streamingContent
+               }
+               
+               setMessages(prev => prev.map(msg => 
+                 msg.id === assistantMessageId 
+                   ? { ...msg, responseRounds: tempRounds }
+                   : msg
+               ))
+             })
+
+            // Parse new content for thinking
+            const { content: newCleanContent, thinking: newThinking } = parseThinkingContent(newContinuedContent)
+            
+            // Add new round with results
+            responseRounds.push({
+              content: newCleanContent,
+              thinking: newThinking.length > 0 ? newThinking : undefined,
+              toolCalls: newToolCalls,
+              toolResults: undefined
             })
+
+            currentToolCalls = newToolCalls || []
+            roundIndex++
+
+            // Update message with current progress
+            setMessages(prev => prev.map(msg => 
+              msg.id === assistantMessageId 
+                ? { 
+                    ...msg, 
+                    responseRounds: [...responseRounds]
+                  }
+                : msg
+            ))
+
+          } catch (error) {
+            console.error('Error continuing conversation:', error)
+            responseRounds.push({
+              content: `*Error continuing conversation: ${error instanceof Error ? error.message : 'Unknown error'}*`,
+              toolCalls: undefined,
+              toolResults: undefined
+            })
+            break
           }
         }
 
-        // Mark tools as completed
+        // Final update
         setMessages(prev => prev.map(msg => 
           msg.id === assistantMessageId 
-            ? { ...msg, toolResults, isExecutingTools: false, executingToolIndex: undefined }
+            ? { 
+                ...msg, 
+                content: initialCleanContent,
+                responseRounds: responseRounds,
+                isExecutingTools: false,
+                executingToolIndex: undefined
+              }
             : msg
         ))
-
-        // Continue the conversation with tool results
-        const toolContext = toolResults.map((result, i) => {
-          const toolName = toolCalls[i].name
-          const args = JSON.stringify(toolCalls[i].arguments)
-          if (result.success) {
-            return `Tool: ${toolName}(${args})\nResult: ${JSON.stringify(result.data || result)}`
-          } else {
-            return `Tool: ${toolName}(${args})\nError: ${result.error}`
-          }
-        }).join('\n\n')
-
-                // Continue the AI conversation with tool results
-        const continuationPrompt = `Based on the tool execution results above, please continue your response (do not repeat your previous response, only provide additional analysis/conclusion):\n\n${toolContext}`
-
-        try {
-          const { content: continuedContent } = await callAI([
-            ...messages, 
-            userMessage, 
-            { 
-              id: assistantMessageId, 
-              content, 
-              role: 'assistant', 
-              timestamp: new Date(), 
-              toolCalls, 
-              toolResults 
-            },
-            {
-              id: Date.now().toString(),
-              content: continuationPrompt,
-              role: 'user',
-              timestamp: new Date()
-            }
-           ], (chunk: string) => {
-             // Stream the continued response
-             setMessages(prev => prev.map(msg => 
-               msg.id === assistantMessageId 
-                 ? { ...msg, continuedContent: (msg.continuedContent || '') + chunk }
-                 : msg
-             ))
-           })
-
-          // Final update with just the continued content (don't duplicate the original)
-          setMessages(prev => prev.map(msg => 
-            msg.id === assistantMessageId 
-              ? { ...msg, continuedContent: continuedContent }
-              : msg
-          ))
-        } catch (error) {
-          console.error('Error continuing conversation:', error)
-          // Just show tool results if continuation fails
-          setMessages(prev => prev.map(msg => 
-            msg.id === assistantMessageId 
-              ? { ...msg, content: content + '\n\n*Tool execution completed. Continuation failed.*' }
-              : msg
-          ))
-        }
       }
     } catch (error) {
       // Update the assistant message with error
@@ -761,218 +873,217 @@ export default function ChatPanel() {
                 }}
               >
                 {(() => {
-                  const { content, thinking, hasThinking } = parseThinkingContent(message.content)
+                  const { segments } = parseThinkingContent(message.content)
                   const isThinkingExpanded = expandedThinking.has(message.id)
                   
                   return (
                     <>
-                      {/* Thinking Toggle Button */}
-                      {hasThinking && (
-                        <div style={{ marginBottom: '8px' }}>
-                          <button
-                            onClick={() => toggleThinking(message.id)}
-                            style={{
-                              fontSize: '10px',
-                              padding: '3px 6px',
-                              backgroundColor: 'rgba(139, 92, 246, 0.1)',
-                              color: '#8b5cf6',
-                              border: '1px solid rgba(139, 92, 246, 0.3)',
-                              borderRadius: '4px',
-                              cursor: 'pointer',
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: '4px'
-                            }}
-                          >
-                            <span>{isThinkingExpanded ? '🧠' : '💭'}</span>
-                            <span>{isThinkingExpanded ? 'Hide' : 'Show'} thinking ({thinking.length})</span>
-                          </button>
-                        </div>
-                      )}
-
-                      {/* Thinking Content */}
-                      {hasThinking && isThinkingExpanded && (
-                        <div style={{
-                          marginBottom: '12px',
-                          padding: '10px',
-                          backgroundColor: 'rgba(139, 92, 246, 0.05)',
-                          border: '1px solid rgba(139, 92, 246, 0.2)',
-                          borderRadius: '6px',
-                          borderLeft: '3px solid #8b5cf6'
-                        }}>
-                          <div style={{
-                            display: 'flex',
-                            alignItems: 'center',
-                            gap: '4px',
-                            marginBottom: '6px',
-                            fontSize: '10px',
-                            fontWeight: '600',
-                            color: '#8b5cf6'
-                          }}>
-                            <span>🧠</span>
-                            <span>AI Thinking Process</span>
-                          </div>
-                          {thinking.map((thinkBlock, index) => (
-                            <div key={index} style={{
-                              marginBottom: index < thinking.length - 1 ? '8px' : '0',
-                              fontSize: '10px',
-                              lineHeight: '1.3',
-                              color: 'var(--muted-foreground)',
-                              fontStyle: 'italic'
-                            }}>
-                              {thinking.length > 1 && (
-                                <div style={{
-                                  fontSize: '9px',
-                                  fontWeight: '600',
+                      {/* Render content and thinking blocks in sequential order */}
+                      <div style={{ fontSize: '11px', lineHeight: '1.4' }}>
+                                        {(() => {
+                  const isThinkingExpanded = expandedThinking.has(message.id)
+                  
+                  // Use new responseRounds structure if available, otherwise fall back to old parsing
+                  if (message.responseRounds && message.responseRounds.length > 0) {
+                    return message.responseRounds.map((round, roundIndex) => (
+                      <div key={`round-${roundIndex}`} style={{ marginBottom: roundIndex < message.responseRounds!.length - 1 ? '16px' : '0' }}>
+                        {/* Round Thinking (before tool calls) */}
+                        {round.thinking && round.thinking.length > 0 && (
+                          <div style={{ margin: '8px 0' }}>
+                            <div style={{ marginBottom: '4px' }}>
+                              <button
+                                onClick={() => toggleThinking(message.id)}
+                                style={{
+                                  fontSize: '10px',
+                                  padding: '3px 6px',
+                                  backgroundColor: 'rgba(139, 92, 246, 0.1)',
                                   color: '#8b5cf6',
-                                  marginBottom: '3px',
-                                  opacity: 0.8
-                                }}>
-                                  Thinking {index + 1}/{thinking.length}
-                                </div>
-                              )}
-                              <ReactMarkdown 
-                                remarkPlugins={[remarkGfm]}
-                                components={{
-                                  p: ({children}) => <div style={{ margin: '2px 0', fontSize: '10px' }}>{children}</div>,
-                                  code: ({children}) => (
-                                    <code style={{
-                                      backgroundColor: 'rgba(139, 92, 246, 0.1)',
-                                      padding: '1px 3px',
-                                      borderRadius: '2px',
-                                      fontSize: '9px',
-                                      fontFamily: 'monospace'
-                                    }}>
-                                      {children}
-                                    </code>
-                                  ),
-                                  pre: ({children}) => (
-                                    <pre style={{
-                                      backgroundColor: 'rgba(139, 92, 246, 0.1)',
-                                      padding: '4px',
-                                      borderRadius: '3px',
-                                      fontSize: '9px',
-                                      overflow: 'auto',
-                                      margin: '3px 0'
-                                    }}>
-                                      {children}
-                                    </pre>
-                                  )
+                                  border: '1px solid rgba(139, 92, 246, 0.3)',
+                                  borderRadius: '4px',
+                                  cursor: 'pointer',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '4px'
                                 }}
                               >
-                                {thinkBlock}
-                              </ReactMarkdown>
+                                <span>{isThinkingExpanded ? '🧠' : '💭'}</span>
+                                <span>{isThinkingExpanded ? 'Hide' : 'Show'} thinking</span>
+                              </button>
                             </div>
-                          ))}
-                        </div>
-                      )}
-
-                      {/* Main Content with Markdown and Inline Tool Calls */}
-                      <div style={{ fontSize: '11px', lineHeight: '1.4' }}>
-                        {/* Main content (thinking blocks removed) */}
-                        {content && (
-                          <ReactMarkdown 
-                            remarkPlugins={[remarkGfm]}
-                            components={{
-                              p: ({children}) => <div style={{ margin: '4px 0', fontSize: '11px' }}>{children}</div>,
-                              h1: ({children}) => <h1 style={{ fontSize: '14px', fontWeight: 'bold', margin: '6px 0 4px 0' }}>{children}</h1>,
-                              h2: ({children}) => <h2 style={{ fontSize: '13px', fontWeight: 'bold', margin: '6px 0 3px 0' }}>{children}</h2>,
-                              h3: ({children}) => <h3 style={{ fontSize: '12px', fontWeight: 'bold', margin: '5px 0 3px 0' }}>{children}</h3>,
-                              code: ({className, children, ...props}: any) => {
-                                const match = /language-(\w+)/.exec(className || '')
-                                const language = match ? match[1] : ''
-                                const isInline = !language
-                                
-                                return !isInline ? (
-                                  <SyntaxHighlighter
-                                    style={vscDarkPlus as any}
-                                    language={language}
-                                    PreTag="div"
-                                    customStyle={{
-                                      margin: '6px 0',
-                                      borderRadius: '4px',
-                                      fontSize: '10px',
-                                      lineHeight: '1.3',
-                                      padding: '8px'
-                                    }}
-                                  >
-                                    {String(children).replace(/\n$/, '')}
-                                  </SyntaxHighlighter>
-                                ) : (
-                                  <code style={{
-                                    backgroundColor: 'var(--sidebar)',
-                                    padding: '1px 3px',
-                                    borderRadius: '2px',
-                                    fontSize: '10px',
-                                    fontFamily: 'monospace',
-                                    border: '1px solid var(--border)'
-                                  }} {...props}>
-                                    {children}
-                                  </code>
-                                )
-                              },
-                              pre: ({children}) => (
-                                <div style={{ margin: '6px 0' }}>
-                                  {children}
+                            
+                            {isThinkingExpanded && (
+                              <div style={{
+                                padding: '10px',
+                                backgroundColor: 'rgba(139, 92, 246, 0.05)',
+                                border: '1px solid rgba(139, 92, 246, 0.2)',
+                                borderRadius: '6px',
+                                borderLeft: '3px solid #8b5cf6',
+                                marginBottom: '8px'
+                              }}>
+                                <div style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '4px',
+                                  marginBottom: '6px',
+                                  fontSize: '10px',
+                                  fontWeight: '600',
+                                  color: '#8b5cf6'
+                                }}>
+                                  <span>🧠</span>
+                                  <span>AI Thinking</span>
                                 </div>
-                              ),
-                              ul: ({children}) => <ul style={{ margin: '3px 0', paddingLeft: '14px', fontSize: '11px' }}>{children}</ul>,
-                              ol: ({children}) => <ol style={{ margin: '3px 0', paddingLeft: '14px', fontSize: '11px' }}>{children}</ol>,
-                              li: ({children}) => <li style={{ margin: '1px 0', fontSize: '11px' }}>{children}</li>,
-                              blockquote: ({children}) => (
-                                <blockquote style={{
-                                  borderLeft: '2px solid var(--border)',
-                                  paddingLeft: '6px',
-                                  margin: '4px 0',
-                                  fontStyle: 'italic',
-                                  color: 'var(--muted-foreground)',
-                                  fontSize: '10px'
-                                }}>
-                                  {children}
-                                </blockquote>
-                              ),
-                              table: ({children}) => (
-                                <table style={{
-                                  borderCollapse: 'collapse',
-                                  margin: '6px 0',
-                                  fontSize: '10px'
-                                }}>
-                                  {children}
-                                </table>
-                              ),
-                              th: ({children}) => (
-                                <th style={{
-                                  border: '1px solid var(--border)',
-                                  padding: '3px 6px',
-                                  backgroundColor: 'var(--sidebar)',
-                                  fontWeight: 'bold',
-                                  fontSize: '10px'
-                                }}>
-                                  {children}
-                                </th>
-                              ),
-                              td: ({children}) => (
-                                <td style={{
-                                  border: '1px solid var(--border)',
-                                  padding: '3px 6px',
-                                  fontSize: '10px'
-                                }}>
-                                  {children}
-                                </td>
-                              )
-                            }}
-                          >
-                            {content + (streamingMessageId === message.id && !message.toolCalls ? '|' : '')}
-                          </ReactMarkdown>
+                                {round.thinking.map((thinkBlock, thinkIndex) => (
+                                  <div key={thinkIndex} style={{
+                                    marginBottom: thinkIndex < round.thinking!.length - 1 ? '8px' : '0',
+                                    fontSize: '10px',
+                                    lineHeight: '1.3',
+                                    color: 'var(--muted-foreground)',
+                                    fontStyle: 'italic'
+                                  }}>
+                                    <ReactMarkdown 
+                                      remarkPlugins={[remarkGfm]}
+                                      components={{
+                                        p: ({children}) => <div style={{ margin: '2px 0', fontSize: '10px' }}>{children}</div>,
+                                        code: ({children}) => (
+                                          <code style={{
+                                            backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                                            padding: '1px 3px',
+                                            borderRadius: '2px',
+                                            fontSize: '9px',
+                                            fontFamily: 'monospace'
+                                          }}>
+                                            {children}
+                                          </code>
+                                        ),
+                                        pre: ({children}) => (
+                                          <pre style={{
+                                            backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                                            padding: '4px',
+                                            borderRadius: '3px',
+                                            fontSize: '9px',
+                                            overflow: 'auto',
+                                            margin: '3px 0'
+                                          }}>
+                                            {children}
+                                          </pre>
+                                        )
+                                      }}
+                                    >
+                                      {thinkBlock}
+                                    </ReactMarkdown>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
                         )}
 
-                        {/* Inline Tool Calls */}
-                        {message.toolCalls && message.toolCalls.length > 0 && (
+                        {/* Round Content */}
+                        {round.content && (
+                          <div>
+                            <ReactMarkdown 
+                              remarkPlugins={[remarkGfm]}
+                              components={{
+                                p: ({children}) => <div style={{ margin: '4px 0', fontSize: '11px' }}>{children}</div>,
+                                h1: ({children}) => <h1 style={{ fontSize: '14px', fontWeight: 'bold', margin: '6px 0 4px 0' }}>{children}</h1>,
+                                h2: ({children}) => <h2 style={{ fontSize: '13px', fontWeight: 'bold', margin: '6px 0 3px 0' }}>{children}</h2>,
+                                h3: ({children}) => <h3 style={{ fontSize: '12px', fontWeight: 'bold', margin: '5px 0 3px 0' }}>{children}</h3>,
+                                code: ({className, children, ...props}: any) => {
+                                  const match = /language-(\w+)/.exec(className || '')
+                                  const language = match ? match[1] : ''
+                                  const isInline = !language
+                                  
+                                  return !isInline ? (
+                                    <SyntaxHighlighter
+                                      style={vscDarkPlus as any}
+                                      language={language}
+                                      PreTag="div"
+                                      customStyle={{
+                                        margin: '6px 0',
+                                        borderRadius: '4px',
+                                        fontSize: '10px',
+                                        lineHeight: '1.3',
+                                        padding: '8px'
+                                      }}
+                                    >
+                                      {String(children).replace(/\n$/, '')}
+                                    </SyntaxHighlighter>
+                                  ) : (
+                                    <code style={{
+                                      backgroundColor: 'var(--sidebar)',
+                                      padding: '1px 3px',
+                                      borderRadius: '2px',
+                                      fontSize: '10px',
+                                      fontFamily: 'monospace',
+                                      border: '1px solid var(--border)'
+                                    }} {...props}>
+                                      {children}
+                                    </code>
+                                  )
+                                },
+                                pre: ({children}) => (
+                                  <div style={{ margin: '6px 0' }}>
+                                    {children}
+                                  </div>
+                                ),
+                                ul: ({children}) => <ul style={{ margin: '3px 0', paddingLeft: '14px', fontSize: '11px' }}>{children}</ul>,
+                                ol: ({children}) => <ol style={{ margin: '3px 0', paddingLeft: '14px', fontSize: '11px' }}>{children}</ol>,
+                                li: ({children}) => <li style={{ margin: '1px 0', fontSize: '11px' }}>{children}</li>,
+                                blockquote: ({children}) => (
+                                  <blockquote style={{
+                                    borderLeft: '2px solid var(--border)',
+                                    paddingLeft: '6px',
+                                    margin: '4px 0',
+                                    fontStyle: 'italic',
+                                    color: 'var(--muted-foreground)',
+                                    fontSize: '10px'
+                                  }}>
+                                    {children}
+                                  </blockquote>
+                                ),
+                                table: ({children}) => (
+                                  <table style={{
+                                    borderCollapse: 'collapse',
+                                    margin: '6px 0',
+                                    fontSize: '10px'
+                                  }}>
+                                    {children}
+                                  </table>
+                                ),
+                                th: ({children}) => (
+                                  <th style={{
+                                    border: '1px solid var(--border)',
+                                    padding: '3px 6px',
+                                    backgroundColor: 'var(--sidebar)',
+                                    fontWeight: 'bold',
+                                    fontSize: '10px'
+                                  }}>
+                                    {children}
+                                  </th>
+                                ),
+                                td: ({children}) => (
+                                  <td style={{
+                                    border: '1px solid var(--border)',
+                                    padding: '3px 6px',
+                                    fontSize: '10px'
+                                  }}>
+                                    {children}
+                                  </td>
+                                )
+                              }}
+                            >
+                              {round.content}
+                            </ReactMarkdown>
+                          </div>
+                        )}
+
+                        {/* Round Tool Calls */}
+                        {round.toolCalls && round.toolCalls.length > 0 && (
                           <div style={{ margin: '8px 0' }}>
-                            {message.toolCalls.map((call, i) => {
+                            {round.toolCalls.map((call, i) => {
                               const isCurrentlyExecuting = message.isExecutingTools && message.executingToolIndex === i
-                              const isCompleted = message.toolResults && message.toolResults[i]
-                              const result = message.toolResults?.[i]
+                              const isCompleted = round.toolResults && round.toolResults[i]
+                              const result = round.toolResults?.[i]
                               
                               return (
                                 <div key={i} style={{ 
@@ -1014,103 +1125,203 @@ export default function ChatPanel() {
                             })}
                           </div>
                         )}
-
-                        {/* Continued content after tool execution */}
-                        {message.continuedContent && (
-                          <ReactMarkdown 
-                            remarkPlugins={[remarkGfm]}
-                            components={{
-                              p: ({children}) => <div style={{ margin: '4px 0', fontSize: '11px' }}>{children}</div>,
-                              h1: ({children}) => <h1 style={{ fontSize: '14px', fontWeight: 'bold', margin: '6px 0 4px 0' }}>{children}</h1>,
-                              h2: ({children}) => <h2 style={{ fontSize: '13px', fontWeight: 'bold', margin: '6px 0 3px 0' }}>{children}</h2>,
-                              h3: ({children}) => <h3 style={{ fontSize: '12px', fontWeight: 'bold', margin: '5px 0 3px 0' }}>{children}</h3>,
-                              code: ({className, children, ...props}: any) => {
-                                const match = /language-(\w+)/.exec(className || '')
-                                const language = match ? match[1] : ''
-                                const isInline = !language
-                                
-                                return !isInline ? (
-                                  <SyntaxHighlighter
-                                    style={vscDarkPlus as any}
-                                    language={language}
-                                    PreTag="div"
-                                    customStyle={{
-                                      margin: '6px 0',
-                                      borderRadius: '4px',
-                                      fontSize: '10px',
-                                      lineHeight: '1.3',
-                                      padding: '8px'
+                      </div>
+                    ))
+                  } else {
+                    // Fallback to old parsing for messages without responseRounds
+                    const { segments } = parseThinkingContent(message.content)
+                    
+                    return segments.map((segment, index) => {
+                      if (segment.type === 'thinking') {
+                        return (
+                          <div key={`thinking-${index}`} style={{ margin: '8px 0' }}>
+                            <div style={{ marginBottom: '4px' }}>
+                              <button
+                                onClick={() => toggleThinking(message.id)}
+                                style={{
+                                  fontSize: '10px',
+                                  padding: '3px 6px',
+                                  backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                                  color: '#8b5cf6',
+                                  border: '1px solid rgba(139, 92, 246, 0.3)',
+                                  borderRadius: '4px',
+                                  cursor: 'pointer',
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '4px'
+                                }}
+                              >
+                                <span>{isThinkingExpanded ? '🧠' : '💭'}</span>
+                                <span>{isThinkingExpanded ? 'Hide' : 'Show'} thinking</span>
+                              </button>
+                            </div>
+                            
+                            {isThinkingExpanded && (
+                              <div style={{
+                                padding: '10px',
+                                backgroundColor: 'rgba(139, 92, 246, 0.05)',
+                                border: '1px solid rgba(139, 92, 246, 0.2)',
+                                borderRadius: '6px',
+                                borderLeft: '3px solid #8b5cf6'
+                              }}>
+                                <div style={{
+                                  display: 'flex',
+                                  alignItems: 'center',
+                                  gap: '4px',
+                                  marginBottom: '6px',
+                                  fontSize: '10px',
+                                  fontWeight: '600',
+                                  color: '#8b5cf6'
+                                }}>
+                                  <span>🧠</span>
+                                  <span>AI Thinking</span>
+                                </div>
+                                <div style={{
+                                  fontSize: '10px',
+                                  lineHeight: '1.3',
+                                  color: 'var(--muted-foreground)',
+                                  fontStyle: 'italic'
+                                }}>
+                                  <ReactMarkdown 
+                                    remarkPlugins={[remarkGfm]}
+                                    components={{
+                                      p: ({children}) => <div style={{ margin: '2px 0', fontSize: '10px' }}>{children}</div>,
+                                      code: ({children}) => (
+                                        <code style={{
+                                          backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                                          padding: '1px 3px',
+                                          borderRadius: '2px',
+                                          fontSize: '9px',
+                                          fontFamily: 'monospace'
+                                        }}>
+                                          {children}
+                                        </code>
+                                      ),
+                                      pre: ({children}) => (
+                                        <pre style={{
+                                          backgroundColor: 'rgba(139, 92, 246, 0.1)',
+                                          padding: '4px',
+                                          borderRadius: '3px',
+                                          fontSize: '9px',
+                                          overflow: 'auto',
+                                          margin: '3px 0'
+                                        }}>
+                                          {children}
+                                        </pre>
+                                      )
                                     }}
                                   >
-                                    {String(children).replace(/\n$/, '')}
-                                  </SyntaxHighlighter>
-                                ) : (
-                                  <code style={{
-                                    backgroundColor: 'var(--sidebar)',
-                                    padding: '1px 3px',
-                                    borderRadius: '2px',
-                                    fontSize: '10px',
-                                    fontFamily: 'monospace',
-                                    border: '1px solid var(--border)'
-                                  }} {...props}>
-                                    {children}
-                                  </code>
-                                )
-                              },
-                              pre: ({children}) => (
-                                <div style={{ margin: '6px 0' }}>
-                                  {children}
+                                    {segment.text}
+                                  </ReactMarkdown>
                                 </div>
-                              ),
-                              ul: ({children}) => <ul style={{ margin: '3px 0', paddingLeft: '14px', fontSize: '11px' }}>{children}</ul>,
-                              ol: ({children}) => <ol style={{ margin: '3px 0', paddingLeft: '14px', fontSize: '11px' }}>{children}</ol>,
-                              li: ({children}) => <li style={{ margin: '1px 0', fontSize: '11px' }}>{children}</li>,
-                              blockquote: ({children}) => (
-                                <blockquote style={{
-                                  borderLeft: '2px solid var(--border)',
-                                  paddingLeft: '6px',
-                                  margin: '4px 0',
-                                  fontStyle: 'italic',
-                                  color: 'var(--muted-foreground)',
-                                  fontSize: '10px'
-                                }}>
-                                  {children}
-                                </blockquote>
-                              ),
-                              table: ({children}) => (
-                                <table style={{
-                                  borderCollapse: 'collapse',
-                                  margin: '6px 0',
-                                  fontSize: '10px'
-                                }}>
-                                  {children}
-                                </table>
-                              ),
-                              th: ({children}) => (
-                                <th style={{
-                                  border: '1px solid var(--border)',
-                                  padding: '3px 6px',
-                                  backgroundColor: 'var(--sidebar)',
-                                  fontWeight: 'bold',
-                                  fontSize: '10px'
-                                }}>
-                                  {children}
-                                </th>
-                              ),
-                              td: ({children}) => (
-                                <td style={{
-                                  border: '1px solid var(--border)',
-                                  padding: '3px 6px',
-                                  fontSize: '10px'
-                                }}>
-                                  {children}
-                                </td>
-                              )
-                            }}
-                          >
-                            {message.continuedContent + (streamingMessageId === message.id ? '|' : '')}
-                          </ReactMarkdown>
-                        )}
+                              </div>
+                            )}
+                          </div>
+                        )
+                      } else {
+                        return (
+                          <div key={`content-${index}`}>
+                            <ReactMarkdown 
+                              remarkPlugins={[remarkGfm]}
+                              components={{
+                                p: ({children}) => <div style={{ margin: '4px 0', fontSize: '11px' }}>{children}</div>,
+                                h1: ({children}) => <h1 style={{ fontSize: '14px', fontWeight: 'bold', margin: '6px 0 4px 0' }}>{children}</h1>,
+                                h2: ({children}) => <h2 style={{ fontSize: '13px', fontWeight: 'bold', margin: '6px 0 3px 0' }}>{children}</h2>,
+                                h3: ({children}) => <h3 style={{ fontSize: '12px', fontWeight: 'bold', margin: '5px 0 3px 0' }}>{children}</h3>,
+                                code: ({className, children, ...props}: any) => {
+                                  const match = /language-(\w+)/.exec(className || '')
+                                  const language = match ? match[1] : ''
+                                  const isInline = !language
+                                  
+                                  return !isInline ? (
+                                    <SyntaxHighlighter
+                                      style={vscDarkPlus as any}
+                                      language={language}
+                                      PreTag="div"
+                                      customStyle={{
+                                        margin: '6px 0',
+                                        borderRadius: '4px',
+                                        fontSize: '10px',
+                                        lineHeight: '1.3',
+                                        padding: '8px'
+                                      }}
+                                    >
+                                      {String(children).replace(/\n$/, '')}
+                                    </SyntaxHighlighter>
+                                  ) : (
+                                    <code style={{
+                                      backgroundColor: 'var(--sidebar)',
+                                      padding: '1px 3px',
+                                      borderRadius: '2px',
+                                      fontSize: '10px',
+                                      fontFamily: 'monospace',
+                                      border: '1px solid var(--border)'
+                                    }} {...props}>
+                                      {children}
+                                    </code>
+                                  )
+                                },
+                                pre: ({children}) => (
+                                  <div style={{ margin: '6px 0' }}>
+                                    {children}
+                                  </div>
+                                ),
+                                ul: ({children}) => <ul style={{ margin: '3px 0', paddingLeft: '14px', fontSize: '11px' }}>{children}</ul>,
+                                ol: ({children}) => <ol style={{ margin: '3px 0', paddingLeft: '14px', fontSize: '11px' }}>{children}</ol>,
+                                li: ({children}) => <li style={{ margin: '1px 0', fontSize: '11px' }}>{children}</li>,
+                                blockquote: ({children}) => (
+                                  <blockquote style={{
+                                    borderLeft: '2px solid var(--border)',
+                                    paddingLeft: '6px',
+                                    margin: '4px 0',
+                                    fontStyle: 'italic',
+                                    color: 'var(--muted-foreground)',
+                                    fontSize: '10px'
+                                  }}>
+                                    {children}
+                                  </blockquote>
+                                ),
+                                table: ({children}) => (
+                                  <table style={{
+                                    borderCollapse: 'collapse',
+                                    margin: '6px 0',
+                                    fontSize: '10px'
+                                  }}>
+                                    {children}
+                                  </table>
+                                ),
+                                th: ({children}) => (
+                                  <th style={{
+                                    border: '1px solid var(--border)',
+                                    padding: '3px 6px',
+                                    backgroundColor: 'var(--sidebar)',
+                                    fontWeight: 'bold',
+                                    fontSize: '10px'
+                                  }}>
+                                    {children}
+                                  </th>
+                                ),
+                                td: ({children}) => (
+                                  <td style={{
+                                    border: '1px solid var(--border)',
+                                    padding: '3px 6px',
+                                    fontSize: '10px'
+                                  }}>
+                                    {children}
+                                  </td>
+                                )
+                              }}
+                            >
+                              {segment.text}
+                            </ReactMarkdown>
+                          </div>
+                        )
+                      }
+                    })
+                  }
+                })()}
+
+
                       </div>
                     </>
                   )
@@ -1375,11 +1586,10 @@ export default function ChatPanel() {
           </div>
         )}
 
-
         <div
           className="flex flex-col gap-2 p-2 rounded-xl border"
-            style={{
-              backgroundColor: 'var(--sidebar-accent)',
+          style={{
+            backgroundColor: 'var(--sidebar-accent)',
             borderColor: 'var(--border)'
           }}
         >
@@ -1400,18 +1610,18 @@ export default function ChatPanel() {
               }
               className="flex-1 text-sm resize-none focus:outline-none bg-transparent overflow-hidden"
               style={{
-              color: 'var(--sidebar-accent-foreground)',
-              padding: '8px 12px',
+                color: 'var(--sidebar-accent-foreground)',
+                padding: '8px 12px',
                 minHeight: '20px',
                 maxHeight: '120px',
                 height: '20px',
                 lineHeight: '1.4'
               }}
-            disabled={isLoading}
-          />
+              disabled={isLoading}
+            />
           </div>
 
-          <div className="flex flex-row gap-2 p-2 rounded-xl">
+          <div className="flex flex-row gap-2 p-2 rounded-xl justify-between">
             <button
               onClick={() => setShowSettingsMenu(!showSettingsMenu)}
               className="p-2 rounded-lg transition-all duration-200 hover:scale-105"
@@ -1423,22 +1633,20 @@ export default function ChatPanel() {
             >
               <Gear size={14} />
             </button>
-          <button
-            onClick={handleSendMessage}
-            disabled={!input.trim() || isLoading}
+            <button
+              onClick={handleSendMessage}
+              disabled={!input.trim() || isLoading}
               className="p-2 rounded-lg transition-all duration-200 hover:scale-105"
-            style={{
-              backgroundColor: !input.trim() || isLoading ? 'var(--muted)' : 'var(--primary)',
-              color: !input.trim() || isLoading ? 'var(--muted-foreground)' : 'var(--primary-foreground)',
-              cursor: !input.trim() || isLoading ? 'not-allowed' : 'pointer'
-            }}
-          >
-            <PaperPlaneTilt size={14} />
-          </button>
+              style={{
+                backgroundColor: !input.trim() || isLoading ? 'var(--muted)' : 'var(--primary)',
+                color: !input.trim() || isLoading ? 'var(--muted-foreground)' : 'var(--primary-foreground)',
+                cursor: !input.trim() || isLoading ? 'not-allowed' : 'pointer'
+              }}
+            >
+              <PaperPlaneTilt size={14} />
+            </button>
           </div>
         </div>
-
-
 
         {/* Compact Status */}
         <div className="flex items-center justify-between mt-2">
@@ -1458,7 +1666,6 @@ export default function ChatPanel() {
               </>
             )}
           </div>
-
         </div>
       </div>
     </div>
