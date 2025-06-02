@@ -1,0 +1,35 @@
+/* Custom styles for the code editor */
+
+.editor-container {
+  height: 100%;
+  width: 100%;
+}
+
+/* Monaco editor custom styles */
+.monaco-editor {
+  background-color: #1f2937 !important;
+}
+
+.monaco-editor .margin {
+  background-color: #1f2937 !important;
+}
+
+/* Terminal cursor animation */
+.terminal-cursor {
+  animation: blink 1s infinite;
+}
+
+@keyframes blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0; }
+}
+
+/* Title bar drag region */
+.drag-region {
+  -webkit-app-region: drag;
+}
+
+.drag-region button,
+.drag-region .window-control {
+  -webkit-app-region: no-drag;
+}
